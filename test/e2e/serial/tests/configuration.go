@@ -18,6 +18,7 @@ package tests
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/sync/errgroup"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	k8swait "k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
@@ -52,6 +55,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
+	ctrltls "github.com/openshift/controller-runtime-common/pkg/tls"
 
 	depnodes "github.com/k8stopologyawareschedwg/deployer/pkg/clientutil/nodes"
 	"github.com/k8stopologyawareschedwg/deployer/pkg/deployer/platform"
@@ -71,6 +75,8 @@ import (
 	"github.com/openshift-kni/numaresources-operator/internal/wait"
 	"github.com/openshift-kni/numaresources-operator/pkg/kubeletconfig"
 	"github.com/openshift-kni/numaresources-operator/pkg/objectnames"
+	schedupdate "github.com/openshift-kni/numaresources-operator/pkg/objectupdate/sched"
+	objupdate "github.com/openshift-kni/numaresources-operator/pkg/objectupdate/tls"
 	"github.com/openshift-kni/numaresources-operator/pkg/status"
 	"github.com/openshift-kni/numaresources-operator/pkg/validation"
 	rteconfig "github.com/openshift-kni/numaresources-operator/rte/pkg/config"
@@ -134,7 +140,7 @@ var _ = Describe("[serial][disruptive] numaresources configuration management", 
 		// we're ok with any TM policy as long as the updater can handle it,
 		// we use this as proxy for "there is valid NRT data for at least X nodes
 		nrts = e2enrt.FilterByTopologyManagerPolicy(nrtList.Items, intnrt.SingleNUMANode)
-		if len(nrts) < 2 {
+		if len(nrts) < 1 {
 			Skip(fmt.Sprintf("not enough nodes with valid policy - found %d", len(nrts)))
 		}
 
@@ -1491,6 +1497,171 @@ var _ = Describe("[serial][disruptive] numaresources configuration management", 
 					}).WithTimeout(5 * time.Minute).WithPolling(10 * time.Second).Should(BeTrue())
 				}
 			})
+		})
+	})
+
+	Context("scheduler complies with TLS profile modifications", Label(label.Tier0, "feature:tlscompliance"), func() {
+		It("should update scheduler deployment TLS args to adhere to modified TLS profile", Label(label.Slow, label.Reboot), func(ctx context.Context) {
+			By("getting the initial OCP TLS profile")
+			tlsProfileSpec, err := ctrltls.FetchAPIServerTLSProfile(ctx, fxt.Client)
+			Expect(err).ToNot(HaveOccurred(), "unable to get TLS profile from APIServer")
+
+			tlsConfig, _ := ctrltls.NewTLSConfigFromProfile(tlsProfileSpec)
+			tlsCfg := &tls.Config{}
+			tlsConfig(tlsCfg)
+			initialTLSSettings := objupdate.NewSettings(tlsCfg)
+			klog.InfoS("initial TLS settings", "tlsSettings", initialTLSSettings)
+
+			By("getting the initial scheduler object")
+			initialNroSchedObj := &nropv1.NUMAResourcesScheduler{}
+			nroSchedKey := objects.NROSchedObjectKey()
+			Expect(fxt.Client.Get(ctx, nroSchedKey, initialNroSchedObj)).To(Succeed(), "failed to get %q in the cluster", nroSchedKey.String())
+
+			deployment, err := podlist.With(fxt.Client).DeploymentByOwnerReference(ctx, initialNroSchedObj.GetUID())
+			Expect(err).ToNot(HaveOccurred(), "failed to get the deployment")
+			Expect(deployment).ToNot(BeNil(), "scheduler deployment not found")
+			schedulerContainer := &corev1.Container{}
+			for _, container := range deployment.Spec.Template.Spec.Containers {
+				if container.Name == schedupdate.MainContainerName {
+					schedulerContainer = &container
+					break
+				}
+			}
+			By("verify the scheduler deployment uses the initial TLS settings")
+			Expect(schedulerContainer.Args).To(ContainElement("--tls-min-version=" + initialTLSSettings.MinVersion))
+			Expect(schedulerContainer.Args).To(ContainElement("--tls-cipher-suites=" + initialTLSSettings.CipherSuites))
+
+			pods, err := podlist.With(fxt.Client).ByDeployment(ctx, *deployment)
+			Expect(err).ToNot(HaveOccurred(), "failed to get the pods")
+			Expect(pods).ToNot(BeEmpty(), "no pods found for the deployment")
+
+			initialUIDs := make([]types.UID, 0, len(pods))
+			for _, pod := range pods {
+				initialUIDs = append(initialUIDs, pod.GetUID())
+			}
+
+			By("updating the TLS profile to a new settings")
+			klog.InfoS("determining a different TLS profile to apply")
+			apiServerObj := &configv1.APIServer{}
+			apiServerKey := client.ObjectKey{Name: ctrltls.APIServerName}
+			Expect(fxt.Client.Get(ctx, apiServerKey, apiServerObj)).To(Succeed(), "failed to get APIServer object")
+			originalTLSProfile := apiServerObj.Spec.TLSSecurityProfile
+			originalTLSProfileType := configv1.TLSProfileIntermediateType
+			if originalTLSProfile != nil {
+				originalTLSProfileType = originalTLSProfile.Type
+			}
+
+			newProfile := &configv1.TLSSecurityProfile{
+				Type:   configv1.TLSProfileModernType,
+				Modern: &configv1.ModernTLSProfile{},
+			}
+
+			if originalTLSProfileType == newProfile.Type {
+				newProfile = &configv1.TLSSecurityProfile{
+					Type:         configv1.TLSProfileIntermediateType,
+					Intermediate: &configv1.IntermediateTLSProfile{},
+				}
+			}
+
+			klog.InfoS("switching TLS profile", "from", originalTLSProfileType, "to", newProfile.Type)
+
+			By(fmt.Sprintf("updating the APIServer TLS profile to %v", newProfile))
+			Eventually(func(g Gomega) {
+				updatedAPIServer := &configv1.APIServer{}
+				g.Expect(fxt.Client.Get(ctx, apiServerKey, updatedAPIServer)).To(Succeed(), "failed to get APIServer object")
+				updatedAPIServer.Spec.TLSSecurityProfile = newProfile
+				g.Expect(fxt.Client.Update(ctx, updatedAPIServer)).To(Succeed(), "failed to update APIServer TLS profile")
+			}).WithTimeout(5 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+
+			defer func() {
+				By("reverting the APIServer TLS profile to the original setting")
+				Eventually(func(g Gomega) {
+					updatedAPIServer := &configv1.APIServer{}
+					g.Expect(fxt.Client.Get(ctx, apiServerKey, updatedAPIServer)).To(Succeed(), "failed to get APIServer object")
+					updatedAPIServer.Spec = apiServerObj.Spec
+					g.Expect(fxt.Client.Update(ctx, updatedAPIServer)).To(Succeed(), "failed to update APIServer TLS profile")
+				}).WithTimeout(5 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+
+				klog.InfoS("waiting for all MCPs to get updated")
+				eg := errgroup.Group{}
+				allMCPs := &machineconfigv1.MachineConfigPoolList{}
+				Expect(fxt.Client.List(ctx, allMCPs)).To(Succeed())
+				for _, mcp := range allMCPs.Items {
+					eg.Go(func() error {
+						err := wait.With(fxt.Client).ForMachineConfigPoolCondition(ctx, &mcp, machineconfigv1.MachineConfigPoolUpdating)
+						if err != nil {
+							klog.InfoS("failed to wait for MCP to start updating", "mcp", mcp.Name, "err", err)
+							return err
+						}
+						klog.InfoS("MCP started updating; waiting for it to complete", "mcp", mcp.Name)
+						return wait.With(fxt.Client).ForMachineConfigPoolCondition(ctx, &mcp, machineconfigv1.MachineConfigPoolUpdated)
+					})
+				}
+				Expect(eg.Wait()).To(Succeed(), "failed to wait for all MCPs to start updating")
+			}()
+
+			klog.InfoS("waiting for all MCPs to get updated")
+			eg := errgroup.Group{}
+			allMCPs := &machineconfigv1.MachineConfigPoolList{}
+			Expect(fxt.Client.List(ctx, allMCPs)).To(Succeed())
+			for _, mcp := range allMCPs.Items {
+				eg.Go(func() error {
+					err := wait.With(fxt.Client).ForMachineConfigPoolCondition(ctx, &mcp, machineconfigv1.MachineConfigPoolUpdating)
+					if err != nil {
+						klog.InfoS("failed to wait for MCP to start updating", "mcp", mcp.Name, "err", err)
+						return err
+					}
+					klog.InfoS("MCP started updating; waiting for it to complete", "mcp", mcp.Name)
+					return wait.With(fxt.Client).ForMachineConfigPoolCondition(ctx, &mcp, machineconfigv1.MachineConfigPoolUpdated)
+				})
+			}
+			Expect(eg.Wait()).To(Succeed(), "failed to wait for all MCPs to start updating")
+
+			newTLSProfileSpec := *configv1.TLSProfiles[newProfile.Type]
+			newTLSConfigFn, _ := ctrltls.NewTLSConfigFromProfile(newTLSProfileSpec)
+			newTLSCfg := &tls.Config{}
+			newTLSConfigFn(newTLSCfg)
+			expectedTLSSettings := objupdate.NewSettings(newTLSCfg)
+			klog.InfoS("expected TLS settings after update", "tlsSettings", expectedTLSSettings)
+
+			By("waiting for the scheduler deployment to be updated with the new TLS args")
+			Eventually(func(g Gomega) {
+				updatedDeployment := &appsv1.Deployment{}
+				g.Expect(fxt.Client.Get(ctx, client.ObjectKeyFromObject(deployment), updatedDeployment)).To(Succeed())
+
+				var updatedContainer *corev1.Container
+				for i := range updatedDeployment.Spec.Template.Spec.Containers {
+					if updatedDeployment.Spec.Template.Spec.Containers[i].Name == schedupdate.MainContainerName {
+						updatedContainer = &updatedDeployment.Spec.Template.Spec.Containers[i]
+						break
+					}
+				}
+				g.Expect(updatedContainer).ToNot(BeNil(), "scheduler container not found in updated deployment")
+				g.Expect(updatedContainer.Args).To(ContainElement("--tls-min-version="+expectedTLSSettings.MinVersion),
+					"tls-min-version mismatch: got args %v", updatedContainer.Args)
+				g.Expect(updatedContainer.Args).To(ContainElement("--tls-cipher-suites="+expectedTLSSettings.CipherSuites),
+					"tls-cipher-suites mismatch: got args %v", updatedContainer.Args)
+			}).WithTimeout(5 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+
+			By("waiting for the scheduler deployment rollout to complete")
+			_, err = wait.With(fxt.Client).Interval(10*time.Second).Timeout(5*time.Minute).ForDeploymentComplete(ctx, deployment)
+			Expect(err).ToNot(HaveOccurred(), "scheduler deployment rollout did not complete")
+
+			By("verifying the scheduler pods have been restarted with new UIDs")
+			newPods, err := podlist.With(fxt.Client).ByDeployment(ctx, *deployment)
+			Expect(err).ToNot(HaveOccurred(), "failed to get pods after TLS profile update")
+			Expect(newPods).ToNot(BeEmpty(), "no pods found after TLS profile update")
+
+			newUIDs := make([]types.UID, 0, len(newPods))
+			for _, pod := range newPods {
+				newUIDs = append(newUIDs, pod.GetUID())
+			}
+
+			for _, newUID := range newUIDs {
+				for _, initialUID := range initialUIDs {
+					Expect(newUID).ToNot(Equal(initialUID), "scheduler pod was not restarted: UID %s still present", initialUID)
+				}
+			}
 		})
 	})
 })
