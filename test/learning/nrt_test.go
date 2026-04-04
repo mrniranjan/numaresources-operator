@@ -16,10 +16,12 @@ import (
 	nrtv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
     e2enrt "github.com/openshift-kni/numaresources-operator/test/internal/noderesourcetopologies"
 	serialconfig "github.com/openshift-kni/numaresources-operator/test/e2e/serial/config"
+	
 	"github.com/openshift-kni/numaresources-operator/internal/wait"
 	"github.com/openshift-kni/numaresources-operator/test/internal/nrosched"
 	"github.com/openshift-kni/numaresources-operator/test/internal/images"
 	"github.com/openshift-kni/numaresources-operator/test/internal/objects"
+	
     . "github.com/onsi/ginkgo/v2"
     . "github.com/onsi/gomega"
 )
@@ -70,8 +72,6 @@ var _ = Describe("[Learning][nrt] Get latest nrt", Serial, func() {
 		It("Get NRT Candidates", func() {
 			var nrtCandidates []nrtv1alpha2.NodeResourceTopology
 			nrtCandidates = e2enrt.FilterZoneCountEqual(nrtList.Items, 2)
-			fmt.Println("!!!!!!!!!!!!!!!!!!!!!!nrt Candidate Name is :", nrtCandidates[0].ObjectMeta.Name)
-			fmt.Println("@@@@@@@@@@@@@@@Length of nrt candidate: ", len(nrtCandidates))
 			referenceNode := nrtCandidates[0]
 			referenceZone := referenceNode.Zones[0]			
 			cpuQty, ok := e2enrt.FindResourceAllocatableByName(referenceZone.Resources, string(corev1.ResourceCPU))
