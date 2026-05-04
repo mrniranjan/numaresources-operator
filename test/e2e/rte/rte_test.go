@@ -349,39 +349,9 @@ var _ = Describe("with a running cluster with all the components", func() {
 			tlsConfig(tlsCfg)
 			tlsSettings := objtls.NewSettings(tlsCfg)
 			klog.InfoS("Initial TLS Settings", "tlsSettings", tlsSettings)
-			By("Getting the initial NRO operator object")
-			nropObj := &nropv1.NUMAResourcesOperator{}
-			Expect(clients.Client.Get(ctx, client.ObjectKey{Name: objectnames.DefaultNUMAResourcesOperatorCrName}, nropObj)).To(Succeed())
+			By("Verifying RTE DaemonSet TLS flags match the cluster TLS profile")
 			Eventually(func() error {
-				if err := clients.Client.Get(ctx, client.ObjectKey{Name: objectnames.DefaultNUMAResourcesOperatorCrName}, nropObj); err != nil {
-					return fmt.Errorf("failed to get NUMAResourcesOperator: %w", err)
-				}
-				if len(nropObj.Status.NodeGroups) == 0 {
-					return fmt.Errorf("expect the numaresourcesoperator to have at least one NodeGroup in status")
-				}
-				for _, ng := range nropObj.Status.NodeGroups {
-					ds := &appsv1.DaemonSet{}
-					err := clients.Client.Get(ctx, client.ObjectKey{Namespace: ng.DaemonSet.Namespace, Name: ng.DaemonSet.Name}, ds)
-					if err != nil {
-						return fmt.Errorf("failed to get DaemonSet %s/%s: %w", ng.DaemonSet.Namespace, ng.DaemonSet.Name, err)
-					}
-					rteCnt := k8swgobjupdate.FindContainerByName(ds.Spec.Template.Spec.Containers, rteupdate.MainContainerName)
-					if rteCnt == nil {
-						return fmt.Errorf("main container not found daemonsetName=%q", ds.Name)
-					}
-					rteFlags := flagcodec.ParseArgvKeyValue(rteCnt.Args, flagcodec.WithFlagNormalization)
-					if err := matchTLSFlag(rteFlags, "--metrics-tls-min-version", tlsSettings.MinVersion, ds.Name); err != nil {
-						return err
-					}
-					// if apiServer is configured with TLS1.3 there are no args --metrics-tls-cipher-suites because
-					// Go's crypto/tls package handles TLS 1.3 differently than older protocols. In TLS 1.3,
-					// the cipher suites are fixed to a secure, built-in list (which will eventually include Post-Quantum Cryptography algorithms)
-					// and cannot be customized using the standard CipherSuites field. so tlsSettings.CipherSuites would be empty in that case.
-					if err := matchTLSFlag(rteFlags, "--metrics-tls-cipher-suites", tlsSettings.CipherSuites, ds.Name); err != nil {
-						return err
-					}
-				}
-				return nil
+				return checkRTEDaemonSetTLSFlags(ctx, tlsSettings)
 			}).WithTimeout(rteDaemonSetCheckTimeout).WithPolling(rteDaemonSetCheckInterval).Should(Succeed())
 		})
 
@@ -502,36 +472,9 @@ var _ = Describe("with a running cluster with all the components", func() {
 			newTLSConfigFn(newTLSCfg)
 			expectedTLSSettings := objtls.NewSettings(newTLSCfg)
 			klog.InfoS("expected TLS settings after update", "tlsSettings", expectedTLSSettings)
-			By("Getting the initial NRO operator object")
-			nropObj := &nropv1.NUMAResourcesOperator{}
-			Expect(clients.Client.Get(ctx, client.ObjectKey{Name: objectnames.DefaultNUMAResourcesOperatorCrName}, nropObj)).To(Succeed())
+			By("Verifying RTE DaemonSet TLS flags match the updated TLS profile")
 			Eventually(func() error {
-				if err := clients.Client.Get(ctx, client.ObjectKey{Name: objectnames.DefaultNUMAResourcesOperatorCrName}, nropObj); err != nil {
-					return fmt.Errorf("failed to get NUMAResourcesOperator: %w", err)
-				}
-				if len(nropObj.Status.NodeGroups) == 0 {
-					return fmt.Errorf("expect the numaresourcesoperator to have at least one NodeGroup in status")
-				}
-				for _, ng := range nropObj.Status.NodeGroups {
-					ds, err := clients.K8sClient.AppsV1().DaemonSets(ng.DaemonSet.Namespace).Get(ctx, ng.DaemonSet.Name, metav1.GetOptions{})
-					if err != nil {
-						return fmt.Errorf("failed to get DaemonSet %s/%s: %w", ng.DaemonSet.Namespace, ng.DaemonSet.Name, err)
-					}
-					rteCnt := k8swgobjupdate.FindContainerByName(ds.Spec.Template.Spec.Containers, rteupdate.MainContainerName)
-					if rteCnt == nil {
-						return fmt.Errorf("main container not found daemonsetName=%q", ds.Name)
-					}
-					rteFlags := flagcodec.ParseArgvKeyValue(rteCnt.Args, flagcodec.WithFlagNormalization)
-					if err := matchTLSFlag(rteFlags, "--metrics-tls-min-version", expectedTLSSettings.MinVersion, ds.Name); err != nil {
-						return err
-					}
-					// in the case of TLS1.3 the expectedTLSSettings.CipherSuites will be empty
-					// When using a minimum of TLS 1.3—which is mandated by the Modern profile—you generally do not pass or explicitly configure cipher suites
-					if err := matchTLSFlag(rteFlags, "--metrics-tls-cipher-suites", expectedTLSSettings.CipherSuites, ds.Name); err != nil {
-						return err
-					}
-				}
-				return nil
+				return checkRTEDaemonSetTLSFlags(ctx, expectedTLSSettings)
 			}).WithTimeout(rteDaemonSetCheckTimeout).WithPolling(rteDaemonSetCheckInterval).Should(Succeed())
 		})
 	})
@@ -559,6 +502,36 @@ func matchLogLevelToKlog(cnt *corev1.Container, level operatorv1.LogLevel) (bool
 
 	val, found := rteFlags.GetFlag("--")
 	return found, val.Data == kLvl.String()
+}
+
+func checkRTEDaemonSetTLSFlags(ctx context.Context, expected objtls.Settings) error {
+	nropObj := &nropv1.NUMAResourcesOperator{}
+	if err := clients.Client.Get(ctx, client.ObjectKey{Name: objectnames.DefaultNUMAResourcesOperatorCrName}, nropObj); err != nil {
+		return fmt.Errorf("failed to get NUMAResourcesOperator: %w", err)
+	}
+	if len(nropObj.Status.NodeGroups) == 0 {
+		return fmt.Errorf("expect the numaresourcesoperator to have at least one NodeGroup in status")
+	}
+	for _, ng := range nropObj.Status.NodeGroups {
+		ds := &appsv1.DaemonSet{}
+		if err := clients.Client.Get(ctx, client.ObjectKey{Namespace: ng.DaemonSet.Namespace, Name: ng.DaemonSet.Name}, ds); err != nil {
+			return fmt.Errorf("failed to get DaemonSet %s/%s: %w", ng.DaemonSet.Namespace, ng.DaemonSet.Name, err)
+		}
+		rteCnt := k8swgobjupdate.FindContainerByName(ds.Spec.Template.Spec.Containers, rteupdate.MainContainerName)
+		if rteCnt == nil {
+			return fmt.Errorf("main container not found daemonsetName=%q", ds.Name)
+		}
+		rteFlags := flagcodec.ParseArgvKeyValue(rteCnt.Args, flagcodec.WithFlagNormalization)
+		if err := matchTLSFlag(rteFlags, "--metrics-tls-min-version", expected.MinVersion, ds.Name); err != nil {
+			return err
+		}
+		// TLS 1.3 cipher suites are fixed by the Go crypto/tls implementation and cannot
+		// be configured, so expected.CipherSuites will be empty for the Modern profile.
+		if err := matchTLSFlag(rteFlags, "--metrics-tls-cipher-suites", expected.CipherSuites, ds.Name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func matchTLSFlag(rteFlags *flagcodec.Flags, flagName, expected, dsName string) error {
