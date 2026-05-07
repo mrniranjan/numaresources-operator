@@ -355,7 +355,7 @@ var _ = Describe("with a running cluster with all the components", func() {
 			}).WithTimeout(rteDaemonSetCheckTimeout).WithPolling(rteDaemonSetCheckInterval).Should(Succeed())
 		})
 
-		It("[test_id:88383] should update scheduler deployment TLS args to adhere to modified TLS profile", Label(label.Slow, label.Reboot), func(ctx context.Context) {
+		It("[test_id:88383] should update RTE daemonset TLS args to adhere to modified TLS profile", Label(label.Slow, label.Reboot), func(ctx context.Context) {
 			// Maximum time allowed for each MCP reconciliation cycle.
 			// Long timeout because MCP updates can require node drains/reboots.
 			mcpUpdateTimeout := 40 * time.Minute
