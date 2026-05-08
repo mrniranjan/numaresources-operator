@@ -36,7 +36,7 @@ export E2E_TOPOLOGY_MANAGER_SCOPE="${E2E_TOPOLOGY_MANAGER_SCOPE}"
 # --flake-attempts: rerun the test if it fails
 # -requireSuite: fail if tests are not executed because of missing suite
 echo "TM config policy=[${E2E_TOPOLOGY_MANAGER_POLICY}] scope=[${E2E_TOPOLOGY_MANAGER_SCOPE}]"
-${BIN_DIR}/e2e-nrop-rte.test ${NO_COLOR} --ginkgo.v --ginkgo.timeout=5h --ginkgo.flake-attempts=2 --ginkgo.junit-report=${REPORT_DIR}/e2e.xml --ginkgo.skip='\[Disruptive\]|\[StateDirectories\]|\[NodeRefresh\]|\[local\]' --ginkgo.focus='\[release\]'
+${BIN_DIR}/e2e-nrop-rte.test ${NO_COLOR} --ginkgo.v --ginkgo.timeout=5h --ginkgo.flake-attempts=2 --ginkgo.junit-report=${REPORT_DIR}/e2e.xml --ginkgo.skip='\[Disruptive\]|\[StateDirectories\]|\[NodeRefresh\]|\[local\]' --ginkgo.focus='\[release\]|\[config\]|\[podfingerprint\]|\[tlscompliance\]' --ginkgo.label-filter='!reboot_required'
 
 if [ "$ENABLE_SCHED_TESTS" = true ]; then
   # Run install test suite
