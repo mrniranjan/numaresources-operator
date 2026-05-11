@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 
@@ -177,6 +178,43 @@ func FindDisallowedCipher(allowed []string) string {
 		}
 	}
 	return ""
+}
+
+// FetchMetrics performs a TLS handshake to the pod's metrics port and issues
+// an HTTPS GET /metrics request, returning the response body.
+// Unlike ProbeTLSSettings (which only inspects the handshake metadata),
+// this function verifies end-to-end functionality: TLS transport, HTTP
+// request/response, and that the metrics handler behind TLS is actually
+// serving content.
+func FetchMetrics(cli kubernetes.Interface, pod *corev1.Pod, podPort string) ([]byte, error) {
+	var body []byte
+	err := remoteexec.PortForwardToPod(cli, pod, podPort, func(conn net.Conn) error {
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: true,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return fmt.Errorf("TLS handshake failed: %w", err)
+		}
+		defer tlsConn.Close()
+
+		req := fmt.Sprintf("GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nConnection: close\r\n\r\n", podPort)
+		if _, err := tlsConn.Write([]byte(req)); err != nil {
+			return fmt.Errorf("failed to write HTTP request: %w", err)
+		}
+
+		resp, err := io.ReadAll(tlsConn)
+		if err != nil {
+			return fmt.Errorf("failed to read HTTP response: %w", err)
+		}
+		// Strip HTTP headers: body starts after the first \r\n\r\n.
+		parts := strings.SplitN(string(resp), "\r\n\r\n", 2)
+		if len(parts) < 2 {
+			return fmt.Errorf("malformed HTTP response: no body separator found")
+		}
+		body = []byte(parts[1])
+		return nil
+	})
+	return body, err
 }
 
 func TLSVersionBelow(v uint16) (uint16, error) {

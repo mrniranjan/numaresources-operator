@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strconv"
 	"net/url"
 	"reflect"
 	"strings"
@@ -67,6 +68,7 @@ import (
 	"github.com/openshift-kni/numaresources-operator/test/e2e/label"
 	"github.com/openshift-kni/numaresources-operator/test/internal/clients"
 	"github.com/openshift-kni/numaresources-operator/test/internal/objects"
+	intls "github.com/openshift-kni/numaresources-operator/test/internal/tls"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -477,8 +479,122 @@ var _ = Describe("with a running cluster with all the components", func() {
 				return checkRTEDaemonSetTLSFlags(ctx, expectedTLSSettings)
 			}).WithTimeout(rteDaemonSetCheckTimeout).WithPolling(rteDaemonSetCheckInterval).Should(Succeed())
 		})
+
+		DescribeTable("RTE metrics endpoint TLS compliance", Label("tlsbug"),
+			func(ctx context.Context, expectSuccess bool) {
+				const rteMetricsPort = "2112"
+				minVersion, profileSpec := getClusterTLSProfile(ctx)
+				rtePod := getFirstRTEPod(ctx)
+				if expectSuccess {
+					verifyRTETLSPositive(rtePod, rteMetricsPort, minVersion)
+				} else {
+					verifyRTETLSVersionRejected(rtePod, rteMetricsPort, minVersion)
+					verifyRTETLSCipherRejected(rtePod, rteMetricsPort, minVersion, profileSpec)
+				}
+			},
+			Entry("[test_id:88384] positive - should serve metrics over TLS adhering to the cluster profile", true),
+			Entry("[test_id:88385] negative - should reject TLS connections incompatible with the cluster profile", false),
+		)
 	})
 })
+
+func getClusterTLSProfile(ctx context.Context) (uint16, configv1.TLSProfileSpec) {
+	GinkgoHelper()
+
+	profileSpec, err := ctrltls.FetchAPIServerTLSProfile(ctx, clients.Client)
+	Expect(err).ToNot(HaveOccurred(), "unable to get TLS profile from APIServer")
+
+	tlsConfigFn, unsupportedCiphers := ctrltls.NewTLSConfigFromProfile(profileSpec)
+	if len(unsupportedCiphers) > 0 {
+		klog.InfoS("TLS profile has unsupported ciphers", "ciphers", unsupportedCiphers)
+	}
+	cfg := &tls.Config{}
+	tlsConfigFn(cfg)
+	klog.InfoS("cluster TLS minimum version", "version", tls.VersionName(cfg.MinVersion))
+
+	return cfg.MinVersion, profileSpec
+}
+
+func getFirstRTEPod(ctx context.Context) *corev1.Pod {
+	GinkgoHelper()
+
+	daemonSet := getRTEDaemonSetFromNRO(ctx)
+	pods, err := podlist.With(clients.Client).ByDaemonset(ctx, *daemonSet)
+	Expect(err).ToNot(HaveOccurred())
+	Expect(pods).ToNot(BeEmpty(), "expected at least one RTE pod")
+
+	return &pods[0]
+}
+
+func getRTEDaemonSetFromNRO(ctx context.Context) *appsv1.DaemonSet {
+	GinkgoHelper()
+
+	nropObj := &nropv1.NUMAResourcesOperator{}
+	nropKey := client.ObjectKey{Name: objectnames.DefaultNUMAResourcesOperatorCrName}
+	Expect(clients.Client.Get(ctx, nropKey, nropObj)).To(Succeed())
+	Expect(nropObj.Status.NodeGroups).ToNot(BeEmpty(),
+		"NRO %q must have at least one NodeGroup", nropKey.Name)
+
+	nodeGroup := nropObj.Status.NodeGroups[0]
+	daemonSet := &appsv1.DaemonSet{}
+	dsKey := client.ObjectKey{
+		Namespace: nodeGroup.DaemonSet.Namespace,
+		Name:      nodeGroup.DaemonSet.Name,
+	}
+	Expect(clients.Client.Get(ctx, dsKey, daemonSet)).To(Succeed())
+	return daemonSet
+}
+
+func verifyRTETLSPositive(rtePod *corev1.Pod, port string, minVersion uint16) {
+	GinkgoHelper()
+
+	By("Verifying TLS handshake succeeds and negotiated version meets the cluster profile")
+	// Fetch TLS Version and the Cipher supported by TLS version
+	gotVersion, gotCipherID, err := intls.ProbeTLSSettings(clients.K8sClient, rtePod, port)
+	fmt.Println("version : ",strconv.Itoa(int(gotVersion)))
+	fmt.Println("cipherId: ", strconv.Itoa(int(gotCipherID)))
+	Expect(err).ToNot(HaveOccurred(), "TLS handshake failed on pod %q", rtePod.Name)
+	klog.InfoS("negotiated TLS settings", "version", tls.VersionName(gotVersion), "cipher", tls.CipherSuiteName(gotCipherID))
+	Expect(gotVersion).To(BeNumerically(">=", minVersion),
+		"negotiated version %s below minimum %s", tls.VersionName(gotVersion), tls.VersionName(minVersion))
+
+	By("Fetching /metrics over TLS via port-forward")
+	body, err := intls.FetchMetrics(clients.K8sClient, rtePod, port)
+	Expect(err).ToNot(HaveOccurred(), "failed to fetch metrics from pod %q", rtePod.Name)
+	Expect(body).ToNot(BeEmpty(), "metrics response body should not be empty")
+	Expect(string(body)).To(ContainSubstring("rte_noderesourcetopology_writes_total"))
+}
+
+func verifyRTETLSVersionRejected(rtePod *corev1.Pod, port string, minVersion uint16) {
+	GinkgoHelper()
+
+	belowMinVersion, err := intls.TLSVersionBelow(minVersion)
+	Expect(err).ToNot(HaveOccurred(), "cannot determine version below %s", tls.VersionName(minVersion))
+
+	By(fmt.Sprintf("Verifying TLS %s is rejected", tls.VersionName(belowMinVersion)))
+	err = intls.ProbeMaxTLSVersion(clients.K8sClient, rtePod, port, belowMinVersion)
+	Expect(err).To(HaveOccurred(), "should reject TLS %s", tls.VersionName(belowMinVersion))
+	Expect(errors.Is(err, intls.ErrTLSHandshakeRejected)).To(BeTrue(), "got: %v", err)
+}
+
+func verifyRTETLSCipherRejected(rtePod *corev1.Pod, port string, minVersion uint16, profileSpec configv1.TLSProfileSpec) {
+	GinkgoHelper()
+
+	if minVersion == tls.VersionTLS13 {
+		klog.InfoS("TLS 1.3 ciphers are not individually configurable, skipping cipher rejection test")
+		return
+	}
+
+	disallowedCipher := intls.FindDisallowedCipher(profileSpec.Ciphers)
+	if disallowedCipher == "" {
+		Skip("all known TLS 1.2 ciphers are in the allowed set, nothing to test")
+	}
+
+	By(fmt.Sprintf("Verifying cipher %s is rejected", disallowedCipher))
+	err := intls.ProbeTLSCipher(clients.K8sClient, rtePod, port, disallowedCipher)
+	Expect(err).To(HaveOccurred(), "should reject cipher %s", disallowedCipher)
+	Expect(errors.Is(err, intls.ErrTLSHandshakeRejected)).To(BeTrue(), "got: %v", err)
+}
 
 func getOwnedDss(cs kubernetes.Interface, owner metav1.ObjectMeta) ([]appsv1.DaemonSet, error) {
 	dss, err := cs.AppsV1().DaemonSets("").List(context.TODO(), metav1.ListOptions{})
