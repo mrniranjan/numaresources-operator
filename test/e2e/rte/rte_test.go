@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"strconv"
 	"net/url"
 	"reflect"
 	"strings"
@@ -484,12 +483,16 @@ var _ = Describe("with a running cluster with all the components", func() {
 			func(ctx context.Context, expectSuccess bool) {
 				const rteMetricsPort = "2112"
 				minVersion, profileSpec := getClusterTLSProfile(ctx)
-				rtePod := getFirstRTEPod(ctx)
-				if expectSuccess {
-					verifyRTETLSPositive(rtePod, rteMetricsPort, minVersion)
-				} else {
-					verifyRTETLSVersionRejected(rtePod, rteMetricsPort, minVersion)
-					verifyRTETLSCipherRejected(rtePod, rteMetricsPort, minVersion, profileSpec)
+				rtePods := getRTEPodsFromNRO(ctx)
+				for i := range rtePods {
+					rtePod := &rtePods[i]
+					By(fmt.Sprintf("Validating TLS metrics behavior on pod %s/%s", rtePod.Namespace, rtePod.Name))
+					if expectSuccess {
+						verifyRTETLSPositive(rtePod, rteMetricsPort, minVersion)
+					} else {
+						verifyRTETLSVersionRejected(rtePod, rteMetricsPort, minVersion)
+						verifyRTETLSCipherRejected(rtePod, rteMetricsPort, minVersion, profileSpec)
+					}
 				}
 			},
 			Entry("[test_id:88384] positive - should serve metrics over TLS adhering to the cluster profile", true),
@@ -515,18 +518,7 @@ func getClusterTLSProfile(ctx context.Context) (uint16, configv1.TLSProfileSpec)
 	return cfg.MinVersion, profileSpec
 }
 
-func getFirstRTEPod(ctx context.Context) *corev1.Pod {
-	GinkgoHelper()
-
-	daemonSet := getRTEDaemonSetFromNRO(ctx)
-	pods, err := podlist.With(clients.Client).ByDaemonset(ctx, *daemonSet)
-	Expect(err).ToNot(HaveOccurred())
-	Expect(pods).ToNot(BeEmpty(), "expected at least one RTE pod")
-
-	return &pods[0]
-}
-
-func getRTEDaemonSetFromNRO(ctx context.Context) *appsv1.DaemonSet {
+func getRTEPodsFromNRO(ctx context.Context) []corev1.Pod {
 	GinkgoHelper()
 
 	nropObj := &nropv1.NUMAResourcesOperator{}
@@ -535,14 +527,22 @@ func getRTEDaemonSetFromNRO(ctx context.Context) *appsv1.DaemonSet {
 	Expect(nropObj.Status.NodeGroups).ToNot(BeEmpty(),
 		"NRO %q must have at least one NodeGroup", nropKey.Name)
 
-	nodeGroup := nropObj.Status.NodeGroups[0]
-	daemonSet := &appsv1.DaemonSet{}
-	dsKey := client.ObjectKey{
-		Namespace: nodeGroup.DaemonSet.Namespace,
-		Name:      nodeGroup.DaemonSet.Name,
+	var rtePods []corev1.Pod
+	for _, nodeGroup := range nropObj.Status.NodeGroups {
+		daemonSet := &appsv1.DaemonSet{}
+		dsKey := client.ObjectKey{
+			Namespace: nodeGroup.DaemonSet.Namespace,
+			Name:      nodeGroup.DaemonSet.Name,
+		}
+		Expect(clients.Client.Get(ctx, dsKey, daemonSet)).To(Succeed())
+
+		pods, err := podlist.With(clients.Client).ByDaemonset(ctx, *daemonSet)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(pods).ToNot(BeEmpty(), "expected at least one RTE pod for DaemonSet %s/%s", dsKey.Namespace, dsKey.Name)
+		rtePods = append(rtePods, pods...)
 	}
-	Expect(clients.Client.Get(ctx, dsKey, daemonSet)).To(Succeed())
-	return daemonSet
+	Expect(rtePods).ToNot(BeEmpty(), "expected at least one RTE pod from NRO managed DaemonSets")
+	return rtePods
 }
 
 func verifyRTETLSPositive(rtePod *corev1.Pod, port string, minVersion uint16) {
@@ -551,8 +551,6 @@ func verifyRTETLSPositive(rtePod *corev1.Pod, port string, minVersion uint16) {
 	By("Verifying TLS handshake succeeds and negotiated version meets the cluster profile")
 	// Fetch TLS Version and the Cipher supported by TLS version
 	gotVersion, gotCipherID, err := intls.ProbeTLSSettings(clients.K8sClient, rtePod, port)
-	fmt.Println("version : ",strconv.Itoa(int(gotVersion)))
-	fmt.Println("cipherId: ", strconv.Itoa(int(gotCipherID)))
 	Expect(err).ToNot(HaveOccurred(), "TLS handshake failed on pod %q", rtePod.Name)
 	klog.InfoS("negotiated TLS settings", "version", tls.VersionName(gotVersion), "cipher", tls.CipherSuiteName(gotCipherID))
 	Expect(gotVersion).To(BeNumerically(">=", minVersion),

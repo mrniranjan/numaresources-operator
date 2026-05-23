@@ -17,11 +17,13 @@
 package tls
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -189,29 +191,43 @@ func FindDisallowedCipher(allowed []string) string {
 func FetchMetrics(cli kubernetes.Interface, pod *corev1.Pod, podPort string) ([]byte, error) {
 	var body []byte
 	err := remoteexec.PortForwardToPod(cli, pod, podPort, func(conn net.Conn) error {
-		tlsConn := tls.Client(conn, &tls.Config{
-			InsecureSkipVerify: true,
-		})
-		if err := tlsConn.Handshake(); err != nil {
-			return fmt.Errorf("TLS handshake failed: %w", err)
+		usedConn := false
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				if usedConn {
+					return nil, fmt.Errorf("unexpected extra dial attempt while fetching metrics")
+				}
+				usedConn = true
+				return conn, nil
+			},
+			DisableKeepAlives: true,
 		}
-		defer tlsConn.Close()
+		defer tr.CloseIdleConnections()
 
-		req := fmt.Sprintf("GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nConnection: close\r\n\r\n", podPort)
-		if _, err := tlsConn.Write([]byte(req)); err != nil {
-			return fmt.Errorf("failed to write HTTP request: %w", err)
-		}
-
-		resp, err := io.ReadAll(tlsConn)
+		httpCli := &http.Client{Transport: tr}
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://127.0.0.1/metrics", nil)
 		if err != nil {
-			return fmt.Errorf("failed to read HTTP response: %w", err)
+			return fmt.Errorf("failed to build HTTP request: %w", err)
 		}
-		// Strip HTTP headers: body starts after the first \r\n\r\n.
-		parts := strings.SplitN(string(resp), "\r\n\r\n", 2)
-		if len(parts) < 2 {
-			return fmt.Errorf("malformed HTTP response: no body separator found")
+		req.Host = "127.0.0.1:" + podPort
+
+		resp, err := httpCli.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed HTTPS GET /metrics: %w", err)
 		}
-		body = []byte(parts[1])
+		defer resp.Body.Close()
+
+		payload, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read /metrics response body: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("unexpected /metrics status code %d: %q", resp.StatusCode, strings.TrimSpace(string(payload)))
+		}
+		body = payload
 		return nil
 	})
 	return body, err
