@@ -189,48 +189,74 @@ func FindDisallowedCipher(allowed []string) string {
 // request/response, and that the metrics handler behind TLS is actually
 // serving content.
 func FetchMetrics(cli kubernetes.Interface, pod *corev1.Pod, podPort string) ([]byte, error) {
+	return fetchMetricsWithPortForward(cli, pod, podPort)
+}
+
+// fetchMetricsWithPortForward opens a port-forward stream and fetches /metrics over it.
+func fetchMetricsWithPortForward(cli kubernetes.Interface, pod *corev1.Pod, podPort string) ([]byte, error) {
 	var body []byte
 	err := remoteexec.PortForwardToPod(cli, pod, podPort, func(conn net.Conn) error {
-		usedConn := false
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				if usedConn {
-					return nil, fmt.Errorf("unexpected extra dial attempt while fetching metrics")
-				}
-				usedConn = true
-				return conn, nil
-			},
-			DisableKeepAlives: true,
-		}
-		defer tr.CloseIdleConnections()
-
-		httpCli := &http.Client{Transport: tr}
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://127.0.0.1/metrics", nil)
-		if err != nil {
-			return fmt.Errorf("failed to build HTTP request: %w", err)
-		}
-		req.Host = "127.0.0.1:" + podPort
-
-		resp, err := httpCli.Do(req)
-		if err != nil {
-			return fmt.Errorf("failed HTTPS GET /metrics: %w", err)
-		}
-		defer resp.Body.Close()
-
-		payload, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read /metrics response body: %w", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("unexpected /metrics status code %d: %q", resp.StatusCode, strings.TrimSpace(string(payload)))
-		}
-		body = payload
-		return nil
+		var reqErr error
+		body, reqErr = doMetricsRequestOverConnection(conn, podPort)
+		return reqErr
 	})
-	return body, err
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// doMetricsRequestOverConnection executes an HTTPS /metrics request on an existing stream connection.
+func doMetricsRequestOverConnection(conn net.Conn, podPort string) ([]byte, error) {
+	httpCli := buildMetricsHTTPClient(conn)
+	defer httpCli.CloseIdleConnections()
+	return executeMetricsRequest(httpCli, podPort)
+}
+
+// buildMetricsHTTPClient constructs an HTTP client that dials using the provided stream connection.
+func buildMetricsHTTPClient(conn net.Conn) *http.Client {
+	usedConn := false
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		// The port-forward callback provides a single live stream connection.
+		// We allow exactly one dial so HTTP/TLS uses this stream and fails fast
+		// if a retry/extra dial is attempted.
+		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			if usedConn {
+				return nil, fmt.Errorf("unexpected extra dial attempt while fetching metrics")
+			}
+			usedConn = true
+			return conn, nil
+		},
+		DisableKeepAlives: true,
+	}
+	return &http.Client{Transport: tr}
+}
+
+// executeMetricsRequest performs the HTTPS GET /metrics and validates the HTTP response.
+func executeMetricsRequest(httpCli *http.Client, podPort string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://127.0.0.1/metrics", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build HTTP request: %w", err)
+	}
+	req.Host = "127.0.0.1:" + podPort
+
+	resp, err := httpCli.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed HTTPS GET /metrics: %w", err)
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read /metrics response body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected /metrics status code %d: %q", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+	return responseBody, nil
 }
 
 func TLSVersionBelow(v uint16) (uint16, error) {
