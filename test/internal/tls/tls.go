@@ -258,6 +258,9 @@ func CheckRTEDaemonSetTLSFlags(ctx context.Context, cli client.Client, expected 
 		if err := matchTLSFlag(rteFlags, "--metrics-tls-cipher-suites", expected.CipherSuites, ds.Name); err != nil {
 			return err
 		}
+		if err := matchTLSFlag(rteFlags, "--metrics-tls-curve-preferences", expected.CurvePreferences, ds.Name); err != nil {
+			return err
+		}
 	}
 	return nil
 }
