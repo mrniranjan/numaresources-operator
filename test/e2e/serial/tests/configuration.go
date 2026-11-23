@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/url"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1829,34 +1830,6 @@ var _ = Describe("[serial][disruptive] numaresources configuration management", 
 		)
 		It("[test_id:88383] should update RTE daemonset TLS args to adhere to modified TLS profile", Label(label.Reboot, label.Slow, label.Tier2), func(ctx context.Context) {
 			fxt.IsRebootTest = true
-			mcpUpdateTimeout := 40 * time.Minute
-			mcpUpdatePolling := 20 * time.Second
-
-			waitForMCPsAndVerifyNodes := func(ctx context.Context, reason string) {
-				e2efixture.By("waiting for all MCPs to get updated")
-				eg := errgroup.Group{}
-				allMCPs := &machineconfigv1.MachineConfigPoolList{}
-				Expect(e2eclient.Client.List(ctx, allMCPs)).To(Succeed())
-				for _, mcp := range allMCPs.Items {
-					eg.Go(func() error {
-						err := waitForMCPConditionWithRetry(ctx, &mcp, machineconfigv1.MachineConfigPoolUpdating, mcpUpdateTimeout, mcpUpdatePolling)
-						if err != nil {
-							klog.InfoS("failed to wait for MCP to start updating", "mcp", mcp.Name, "err", err)
-							return err
-						}
-						klog.InfoS("MCP started updating; waiting for it to complete", "mcp", mcp.Name)
-						return waitForMCPConditionWithRetry(ctx, &mcp, machineconfigv1.MachineConfigPoolUpdated, mcpUpdateTimeout, mcpUpdatePolling)
-					})
-				}
-				Expect(eg.Wait()).To(Succeed(), "failed while waiting for mcp update")
-
-				e2efixture.By("verifying per-node MachineConfig alignment %s", reason)
-				for i := range allMCPs.Items {
-					Expect(verifyNodesMatchMCPConfig(ctx, &allMCPs.Items[i])).To(Succeed(),
-						"node config mismatch for MCP %q", allMCPs.Items[i].Name)
-				}
-			}
-
 			e2efixture.By("determining a different TLS profile to apply")
 			apiServerObj := &configv1.APIServer{}
 			apiServerKey := client.ObjectKey{Name: ctrltls.APIServerName}
@@ -1912,6 +1885,116 @@ var _ = Describe("[serial][disruptive] numaresources configuration management", 
 			Eventually(func(g Gomega) {
 				g.Expect(intls.CheckRTEDaemonSetTLSFlags(ctx, e2eclient.Client, expectedTLSSettings)).To(Succeed())
 			}).WithTimeout(rteDaemonSetCheckTimeout).WithPolling(rteDaemonSetCheckInterval).Should(Succeed())
+		})
+	})
+
+	Context("[tlscompliance]RTE and scheduler comply with restricted TLS profile modifications", Label("curve"), func() {
+		It("[test_id: TBD] should reconcile restricted and empty TLS curve arguments for both operands", func(ctx context.Context) {
+			fxt.IsRebootTest = true
+			apiServerKey := client.ObjectKey{Name: ctrltls.APIServerName}
+			apiServer := &configv1.APIServer{}
+			Expect(e2eclient.Client.Get(ctx, apiServerKey, apiServer)).To(Succeed())
+			originalSpec := apiServer.Spec.DeepCopy()
+
+			// 1. Check openshift feature Gate
+			enabled, err := tlsGroupPreferencesEnabled(ctx, e2eclient.Client)
+			Expect(err).ToNot(HaveOccurred())
+			if !enabled {
+				Skip("TLSGroupPreferences feature gate is not enabled on this cluster")
+			}
+
+			nroSched := &nropv1.NUMAResourcesScheduler{}
+			err = e2eclient.Client.Get(ctx, objects.NROSchedObjectKey(), nroSched)
+			if apierrors.IsNotFound(err) {
+				Skip("NUMAResourcesScheduler is not deployed on this cluster")
+			}
+			Expect(err).ToNot(HaveOccurred(), "failed to get NUMAResourcesScheduler")
+
+			// 2. setup rollback in DeferCleanup
+			restore := func(ctx context.Context) {
+				Eventually(func(g Gomega) {
+					current := &configv1.APIServer{}
+					g.Expect(e2eclient.Client.Get(ctx, apiServerKey, current)).To(Succeed())
+					current.Spec = *originalSpec
+					g.Expect(e2eclient.Client.Update(ctx, current)).To(Succeed())
+				}).WithTimeout(10 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+				waitForMCPsAndVerifyNodes(ctx, "after TLS Curve rollback")
+
+			}
+			DeferCleanup(restore)
+
+			updateProfile := func(ctx context.Context, profile *configv1.TLSSecurityProfile) {
+				Eventually(func(g Gomega) {
+					current := &configv1.APIServer{}
+					g.Expect(e2eclient.Client.Get(ctx, apiServerKey, current)).To(Succeed())
+					current.Spec.TLSSecurityProfile = profile
+					g.Expect(e2eclient.Client.Update(ctx, current)).To(Succeed())
+				}).WithTimeout(10 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+			}
+
+			intermediate := configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
+
+			// 3. set restricted custom curve preference (X22519, secp256r1)
+			restricted := &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						MinTLSVersion: intermediate.MinTLSVersion,
+						Ciphers:       append([]string(nil), intermediate.Ciphers...),
+						Groups:        []configv1.TLSGroup{configv1.TLSGroupX25519, configv1.TLSGroupSecP256r1},
+					},
+				},
+			}
+			e2efixture.By("Setting a restricted custom TLS group list (29,33)")
+			updateProfile(ctx, restricted)
+
+			// Verify API server did not drop the group field
+			persisted := &configv1.APIServer{}
+			Expect(e2eclient.Client.Get(ctx, apiServerKey, persisted)).To(Succeed())
+			if persisted.Spec.TLSSecurityProfile == nil || persisted.Spec.TLSSecurityProfile.Custom == nil ||
+				!slices.Equal(persisted.Spec.TLSSecurityProfile.Custom.Groups, restricted.Custom.TLSProfileSpec.Groups) {
+				Skip("the API server dropped the custom TLS groups; TLSGroupPreferences not enforced")
+			}
+			waitForMCPsAndVerifyNodes(ctx, "after restricted groups")
+
+			// 4. Assert exact CSV "29, 23 on both operands"
+			apply, _ := ctrltls.NewTLSConfigFromProfile(restricted.Custom.TLSProfileSpec)
+			cfg := &tls.Config{}
+			apply(cfg)
+			expectedRestricted := objtls.NewSettings(cfg)
+			Expect(expectedRestricted.CurvePreferences).To(Equal("29,23"))
+
+			Eventually(func(g Gomega) {
+				g.Expect(intls.CheckRTEDaemonSetTLSFlags(ctx, e2eclient.Client, expectedRestricted)).To(Succeed())
+				g.Expect(intls.CheckSchedulerDeploymentTLSFlags(ctx, e2eclient.Client, expectedRestricted)).To(Succeed())
+			}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(Succeed())
+
+			// 5. Transition to empty groups (delete-on-empty)
+			emptyGroups := &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						MinTLSVersion: intermediate.MinTLSVersion,
+						Ciphers:       append([]string(nil), intermediate.Ciphers...),
+						Groups:        nil,
+					},
+				},
+			}
+			e2efixture.By("removing custom TLS groups(testing delete-on-empty)")
+			updateProfile(ctx, emptyGroups)
+			waitForMCPsAndVerifyNodes(ctx, "after empty groups")
+
+			// 6. Assert both curve flags are absent/delete
+			apply, _ = ctrltls.NewTLSConfigFromProfile(emptyGroups.Custom.TLSProfileSpec)
+			cfg = &tls.Config{}
+			apply(cfg)
+			expectedEmpty := objtls.NewSettings(cfg)
+			Expect(expectedEmpty.CurvePreferences).To(BeEmpty())
+			// compare RTE and scheduler tls flags of RTE/Scheduler against expectedEmpty
+			Eventually(func(g Gomega) {
+				g.Expect(intls.CheckRTEDaemonSetTLSFlags(ctx, e2eclient.Client, expectedEmpty)).To(Succeed())
+				g.Expect(intls.CheckSchedulerDeploymentTLSFlags(ctx, e2eclient.Client, expectedEmpty)).To(Succeed())
+			}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(Succeed())
 		})
 	})
 })
@@ -2181,7 +2264,6 @@ func updatePerformanceProfileFieldUnstructured(dynamicClient dynamic.Interface, 
 		_, err = dynamicClient.Resource(performanceProfileGVR).Update(ctx, profile, metav1.UpdateOptions{})
 		Expect(err).ToNot(HaveOccurred())
 	}).WithTimeout(10 * time.Minute).WithPolling(30 * time.Second).Should(Succeed())
-	return
 }
 
 func getClusterType(ctx context.Context, cli client.Client) label.ClusterType {
@@ -2362,4 +2444,52 @@ func verifyNodesMatchMCPConfig(ctx context.Context, mcp *machineconfigv1.Machine
 	}
 	klog.InfoS("all nodes match MCP config", "mcp", mcp.Name, "config", renderedConfig, "nodeCount", len(nodeList.Items))
 	return nil
+}
+
+func tlsGroupPreferencesEnabled(ctx context.Context, cli client.Client) (bool, error) {
+	fg := &configv1.FeatureGate{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: "cluster"}, fg); err != nil {
+		return false, err
+	}
+	for _, version := range fg.Status.FeatureGates {
+		for _, enabled := range version.Enabled {
+			if enabled.Name == "TLSGroupPreferences" {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func waitForMCPsAndVerifyNodes(ctx context.Context, reason string) {
+	GinkgoHelper()
+	const (
+		mcpUpdateTimeout = 40 * time.Minute
+		mcpUpdatePolling = 20 * time.Second
+	)
+
+	e2efixture.By("waiting for all MCPs to get updated")
+	allMCPs := &machineconfigv1.MachineConfigPoolList{}
+	Expect(e2eclient.Client.List(ctx, allMCPs)).To(Succeed())
+	eg, egCtx := errgroup.WithContext(ctx)
+	for i := range allMCPs.Items {
+		mcp := &allMCPs.Items[i]
+		if mcp.Status.MachineCount == 0 {
+			klog.InfoS("skipping MCP with no machines", "mcp", mcp.Name)
+			continue
+		}
+		eg.Go(func() error {
+			if err := waitForMCPConditionWithRetry(egCtx, mcp, machineconfigv1.MachineConfigPoolUpdating, mcpUpdateTimeout, mcpUpdatePolling); err != nil {
+				klog.InfoS("failed to wait for MCP to start updating", "mcp", mcp.Name, "err", err)
+				return err
+			}
+			klog.InfoS("MCP started updating; waiting for it to complete", "mcp", mcp.Name)
+			return waitForMCPConditionWithRetry(ctx, mcp, machineconfigv1.MachineConfigPoolUpdated, mcpUpdateTimeout, mcpUpdatePolling)
+		})
+	}
+	Expect(eg.Wait()).To(Succeed(), "failed while waiting for mcp update")
+	e2efixture.By("verifying per-node MachineConfig alignment %s", reason)
+	for i := range allMCPs.Items {
+		Expect(verifyNodesMatchMCPConfig(ctx, &allMCPs.Items[i])).To(Succeed(), "node config mismatch for MCP %q", allMCPs.Items[i].Name)
+	}
 }

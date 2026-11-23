@@ -1,3 +1,4 @@
+
 /*
  * Copyright 2026 Red Hat, Inc.
  *
@@ -33,6 +34,7 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	configv1 "github.com/openshift/api/config/v1"
 	ctrltls "github.com/openshift/controller-runtime-common/pkg/tls"
 	libgocrypto "github.com/openshift/library-go/pkg/crypto"
@@ -43,6 +45,7 @@ import (
 	k8swgobjupdate "github.com/openshift-kni/numaresources-operator/pkg/numaresourcesoperator/objectupdate"
 	"github.com/openshift-kni/numaresources-operator/pkg/objectnames"
 	rteupdate "github.com/openshift-kni/numaresources-operator/pkg/objectupdate/rte"
+	schedupdate "github.com/openshift-kni/numaresources-operator/pkg/objectupdate/sched"
 	objtls "github.com/openshift-kni/numaresources-operator/pkg/objectupdate/tls"
 )
 
@@ -58,6 +61,20 @@ var ErrTLSServerRejected = fmt.Errorf("%w: server sent TLS alert", ErrTLSHandsha
 // incompatible (e.g. MinVersion > MaxVersion, or no matching cipher suites).
 var ErrTLSClientConfigIncompatible = fmt.Errorf("%w: Go client TLS config incompatible", ErrTLSHandshakeRejected)
 
+// ErrSchedulerNotDeployed reports that NUMAResourcesScheduler is absent, so
+// there is no scheduler operand whose TLS settings can be verified
+var ErrSchedulerNotDeployed = errors.New("scheduler is not deployed")
+
+// tlsConfigOpt transforms client tls.Config
+type tlsConfigOpt func(*tls.Config)
+
+var goClientCurves = []tls.CurveID{
+		tls.CurveP521, // 25 - Babsent from every built-in profile
+		tls.CurveP256, // 23
+		tls.CurveP384, // 24
+		tls.X25519, // 29
+}
+
 func wrapTLSHandshakeError(err error) error {
 	if err == nil {
 		return nil
@@ -71,7 +88,8 @@ func wrapTLSHandshakeError(err error) error {
 		return fmt.Errorf("%w: %w", ErrTLSServerRejected, err)
 	}
 	if strings.Contains(err.Error(), "no supported versions") ||
-		strings.Contains(err.Error(), "no ciphers available") {
+		strings.Contains(err.Error(), "no ciphers available") ||
+		strings.Contains(err.Error(), "no supported elliptic curves") {
 		return fmt.Errorf("%w: %w", ErrTLSClientConfigIncompatible, err)
 	}
 	return err
@@ -107,6 +125,16 @@ func ProbeMaxTLSVersion(cli kubernetes.Interface, pod *corev1.Pod, podPort strin
 	})
 }
 
+// ProbeTLSState performs unconstrained handshake and returns full connection state
+func ProbeTLSState(cli kubernetes.Interface, pod *corev1.Pod, port string) (tls.ConnectionState, error) {
+	return probeTLSWithConfig(cli, pod, port)
+}
+
+// ProbeTLSCurve pins the handshake to a single curve (for positive or negative tests).
+func ProbeTLSCurve(cli kubernetes.Interface, pod *corev1.Pod, port string, curve tls.CurveID) (tls.ConnectionState, error) {
+	return probeTLSWithConfig(cli, pod, port, withCurve(curve))
+}
+
 // ProbeTLSCipher checks whether the pod's server rejects
 // TLS connections when the client only offers the given cipher (OpenSSL name).
 // Since this is dedicated to invalidating ciphers, it is assumed that it is
@@ -118,39 +146,10 @@ func ProbeTLSCipher(cli kubernetes.Interface, pod *corev1.Pod, podPort string, c
 	}
 	key := client.ObjectKeyFromObject(pod)
 	klog.InfoS("probe with TLS cipher", "pod", key.String(), "port", podPort, "cipher", cipher, "cipherID", cipherID)
-
-	return remoteexec.PortForwardToPod(cli, pod, podPort, func(conn net.Conn) error {
-		_, err := tlsHandshake(conn, &tls.Config{
-			InsecureSkipVerify: true, // we care about the version/cipher not the cert chain so skip cert validation
-			MaxVersion:         tls.VersionTLS12,
-			CipherSuites:       []uint16{cipherID},
-		})
-		return wrapTLSHandshakeError(err)
-	})
+	_, err = probeTLSWithConfig(cli, pod, podPort, withCipher(cipherID))
+	return err
 }
 
-// ProbeTLSSettings opens a TLS connection to the pod and returns the negotiated
-// TLS version and cipher suite.
-func ProbeTLSSettings(cli kubernetes.Interface, pod *corev1.Pod, podPort string) (version uint16, cipherSuite uint16, err error) {
-	key := client.ObjectKeyFromObject(pod)
-
-	err = remoteexec.PortForwardToPod(cli, pod, podPort, func(conn net.Conn) error {
-		state, tlsErr := tlsHandshake(conn, &tls.Config{
-			InsecureSkipVerify: true, // we care about the version/cipher not the cert chain so skip cert validation
-		})
-		if tlsErr != nil {
-			return tlsErr
-		}
-		version = state.Version
-		cipherSuite = state.CipherSuite
-		klog.InfoS("probe TLS settings", "pod", key.String(), "version", tls.VersionName(version), "cipher", tls.CipherSuiteName(cipherSuite))
-		return nil
-	})
-	return version, cipherSuite, err
-}
-
-// OpenSSLCipherToGoID converts an OpenSSL cipher name to a Go crypto/tls
-// cipher suite ID by going through the IANA name as an intermediate form.
 func OpenSSLCipherToGoID(opensslName string) (uint16, error) {
 	ianaNames := libgocrypto.OpenSSLToIANACipherSuites([]string{opensslName})
 	if len(ianaNames) == 0 {
@@ -170,7 +169,7 @@ func OpenSSLCipherToGoID(opensslName string) (uint16, error) {
 	return 0, fmt.Errorf("no Go cipher suite for IANA name %q (from OpenSSL %q)", ianaName, opensslName)
 }
 
-// findDisallowedCipher returns the first TLS 1.2 cipher (OpenSSL name)
+// FindDisallowedCipher returns the first TLS 1.2 cipher (OpenSSL name)
 // from the broadest upstream profile (Old) that is not in the allowed set.
 // TLS 1.3 ciphers are skipped because they are not individually configurable.
 func FindDisallowedCipher(allowed []string) string {
@@ -279,6 +278,108 @@ func FetchMetrics(cli kubernetes.Interface, pod *corev1.Pod, podPort string) ([]
 	}
 	return body, nil
 }
+
+// CheckSchedulerDeploymentTLSFlags Resolves the scheduler Deployment from the
+// NUMAResourcesScheduler status and compares --tls-min-version, --tls-cipher-suites, --tls-curve-preferences
+func CheckSchedulerDeploymentTLSFlags(ctx context.Context, cli client.Client, expected objtls.Settings) error {
+	nroSched := &nropv1.NUMAResourcesScheduler{}
+	schedKey := client.ObjectKey{Name: objectnames.DefaultNUMAResourcesSchedulerCrName}
+	// fetch CR from cluster
+	if err := cli.Get(ctx, schedKey,nroSched); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("%w: NUMAResourcesScheduler %q not found", ErrSchedulerNotDeployed, schedKey.Name)
+		}
+		return fmt.Errorf("failed to get NUMAResourcesScheduler: %w", err)
+	}
+	
+	// Read the deployment reference that NROP scheduler controller publishes in status
+	depRef := nroSched.Status.Deployment
+	if depRef.Namespace == "" || depRef.Name == "" {
+		return fmt.Errorf("Scheduler deployment is not reported in NUMAResourcesScheduler Status %q status", schedKey.Name)
+	}
+	// fetch scheduler deployer
+	dp := &appsv1.Deployment{}
+	if err := cli.Get(ctx, client.ObjectKey{Namespace: depRef.Namespace, Name: depRef.Name}, dp); err != nil {
+		return fmt.Errorf("failed to get scheduler Deployment %s/%s: %w", depRef.Namespace, depRef.Name, err)
+	}
+	// searches Deployments pod template for the scheduler container
+	cnt := k8swgobjupdate.FindContainerByName(dp.Spec.Template.Spec.Containers,schedupdate.MainContainerName)
+
+	if cnt == nil {
+		return fmt.Errorf("main container not found deploymentName: %q", dp.Name)
+	}
+	// parse arguments of the form --flag=value
+	flags := flagcodec.ParseArgvKeyValue(cnt.Args, flagcodec.WithFlagNormalization)
+	if err := matchTLSFlag(flags, "--tls-min-version", expected.MinVersion, dp.Name); err != nil {
+		return err
+	}
+	if err := matchTLSFlag(flags, "--tls-cipher-suites", expected.CipherSuites, dp.Name); err != nil {
+		return err
+	}
+
+	if err := matchTLSFlag(flags, "--tls-curve-preferences", expected.CurvePreferences, dp.Name); err != nil {
+		return err
+	}
+	return nil
+}
+// CurveIDsFromProfile return allowed Openshift curveIDs 
+func CurveIDsFromProfile(profileSpec configv1.TLSProfileSpec) []tls.CurveID {
+	ids, _ := libgocrypto.TLSGroupsToCurveIDs(profileSpec.Groups)
+	return ids
+}
+
+// FindDisallowedCurve return disallowed CurveID not supported by openshift
+func FindDisallowedCurve(allowed []tls.CurveID) (tls.CurveID, error) {
+	allowedSet := make(map[tls.CurveID]bool, len(allowed))
+	for _, id := range allowed {
+		allowedSet[id] = true
+	}
+	for _, id := range goClientCurves {
+		if !allowedSet[id] {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("every curve the Go client can offer is allowed: %v", allowed)
+}
+
+// withCurve pins the client to offer only the specified key-exchange curve
+func withCurve(curve tls.CurveID) tlsConfigOpt {
+	return func(cfg *tls.Config) {
+		cfg.CurvePreferences = []tls.CurveID{curve}
+	}
+}
+
+// withCipher pins the client to offer only a specific cipher suite
+func withCipher(cipher uint16) tlsConfigOpt {
+	return func(cfg *tls.Config) {
+		cfg.MaxVersion = tls.VersionTLS12
+		cfg.CipherSuites = []uint16{cipher}
+	}
+}
+
+// ProbeTLSWithConfig handles TLS handshake over port-forwarded connection
+func probeTLSWithConfig(cli kubernetes.Interface, pod *corev1.Pod, port string, opts ...tlsConfigOpt) (tls.ConnectionState, error) {
+	var state *tls.ConnectionState
+	// Default baseline client configuration
+	cfg := &tls.Config{
+		InsecureSkipVerify: true, // Probing protocol policy, not certificate authority
+	}
+
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	err := remoteexec.PortForwardToPod(cli, pod, port, func(conn net.Conn) error {
+		var handshakeErr error
+		state, handshakeErr = tlsHandshake(conn, cfg)
+		return wrapTLSHandshakeError(handshakeErr)
+	})
+
+	if state == nil {
+		return tls.ConnectionState{}, err
+	}
+	return *state, err
+}
+
 
 func doMetricsRequestOverConnection(conn net.Conn, podPort string) ([]byte, error) {
 	httpCli := buildMetricsHTTPClient(conn)
